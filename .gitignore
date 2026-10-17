@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# never commit real settings, keys or usage data
+/users.yaml
+state.json
+web_auth.json
+*.key
+*.crt
+*.pem
+backups/
+
+PROGRESS.md

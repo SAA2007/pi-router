@@ -1,0 +1,30 @@
+#!/usr/sbin/nft -f
+# /etc/nftables.conf  - NAT for wlan0 clients, force their DNS to Pi-hole, block DNS-over-TLS,
+# and keep Pi-hole (DNS, DHCP, web) unreachable from the upstream (eth0) network.
+table ip nek0nat
+delete table ip nek0nat
+table ip nek0nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "wlan0" ip daddr != 10.42.0.1 udp dport 53 dnat to 10.42.0.1:53
+    iifname "wlan0" ip daddr != 10.42.0.1 tcp dport 53 dnat to 10.42.0.1:53
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname { "eth0", "wlan1" } masquerade
+  }
+}
+table ip nek0filter
+delete table ip nek0filter
+table ip nek0filter {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname { "eth0", "wlan1" } tcp dport { 53, 80, 443 } drop
+    iifname { "eth0", "wlan1" } udp dport { 53, 67 } drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname "wlan0" tcp dport 853 drop
+    iifname "wlan0" udp dport 853 drop
+  }
+}
