@@ -373,11 +373,24 @@ def setup_psk(cfg):
     run(f"hostapd_cli -i {cfg['interface']} reload_wpa_psk", check=False)
 
 
+def user_ips(cfg, u, leases=None):
+    """Reserved IP plus any active DHCP lease IP held by this user's MACs right now (so limits apply without reconnecting)."""
+    ips = [u["ip"]]
+    reserved = {x["ip"] for x in cfg["users"]}
+    macs = set(user_macs(u))
+    for d in (read_leases() if leases is None else leases):
+        ip = d["ip"]
+        if d["mac"] in macs and ip not in ips and ip not in reserved and re.fullmatch(r"10\.42\.0\.\d{1,3}", ip):
+            ips.append(ip)
+    return ips
+
+
 def setup_shaping(cfg):
     dev = cfg["interface"]
     total = int(cfg["total_mbps"] * 1000)
     guest = int(cfg["guest_mbps"] * 1000)
     gper = int((cfg.get("guest_per_mbps") or cfg["guest_mbps"]) * 1000)
+    leases = read_leases()
     run("modprobe ifb numifbs=1", check=False)
     run(f"ip link add {IFB} type ifb", check=False)
     run(f"ip link set {IFB} up")
@@ -407,12 +420,14 @@ def setup_shaping(cfg):
             run(f"tc class add dev {d} parent 1:1 classid 1:{u['cid']} "
                 f"htb rate {min(1000, kb)}kbit ceil {kb}kbit")
             leaf(d, u["cid"])
-            run(f"tc filter add dev {d} parent 1: protocol ip prio 1 u32 "
-                f"match ip {side} {u['ip']}/32 flowid 1:{u['cid']}")
+            for ip in user_ips(cfg, u, leases):
+                run(f"tc filter add dev {d} parent 1: protocol ip prio 1 u32 "
+                    f"match ip {side} {ip}/32 flowid 1:{u['cid']}")
 
 
 def accounting_text(cfg):
     dev = cfg["interface"]
+    leases = read_leases()
     lines = ["table ip nek0acct", "delete table ip nek0acct", "table ip nek0acct {"]
     for u in cfg["users"]:
         lines.append(f"  counter c_{u['key']} {{ packets 0 bytes 0 }}")
@@ -421,11 +436,13 @@ def accounting_text(cfg):
     lines.append("    type filter hook forward priority 10; policy accept;")
     for u in cfg["users"]:
         if u["paused"]:
-            lines.append(f"    ip saddr {u['ip']} drop")
-            lines.append(f"    ip daddr {u['ip']} drop")
+            for ip in user_ips(cfg, u, leases):
+                lines.append(f"    ip saddr {ip} drop")
+                lines.append(f"    ip daddr {ip} drop")
     for u in cfg["users"]:
-        lines.append(f"    ip saddr {u['ip']} counter name c_{u['key']}")
-        lines.append(f"    ip daddr {u['ip']} counter name c_{u['key']}")
+        for ip in user_ips(cfg, u, leases):
+            lines.append(f"    ip saddr {ip} counter name c_{u['key']}")
+            lines.append(f"    ip daddr {ip} counter name c_{u['key']}")
     lines.append(f'    iifname "{dev}" counter name c_total')
     lines.append(f'    oifname "{dev}" counter name c_total')
     lines += ["  }", "}"]

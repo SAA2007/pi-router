@@ -348,10 +348,9 @@ def test_stations_parse_and_wrong_ip_warning(env, monkeypatch):
     assert st_["aa:3a:e2:7f:0c:5a"] == {"signal": None, "rate": None}
     cfg = n.load()
     leases = [{"mac": "aa:bb:cc:00:11:22", "ip": "10.42.0.109", "host": "phone"}]   # user "ali" reserved .20
+    assert n.user_ips(cfg, cfg["users"][0], leases) == ["10.42.0.20", "10.42.0.109"]
     html = w.user_stats(cfg["users"][0], {"month": "x", "users": {}}, leases, {})
-    assert "on 10.42.0.109" in html and "turn its Wi-Fi off and on" in html and "offline" in html
-    table = w.devices_inner(cfg, leases, {})
-    assert "not on its fixed IP yet" in table
+    assert "on 10.42.0.109 (limits active)" in html and "offline" in html
 
 
 UPLINK = {"backup_iface": "wlan1", "min_mbps": 3, "backup_cap_mbps": 10}

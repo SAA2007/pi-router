@@ -632,7 +632,7 @@ def user_stats(u, st, leases=(), stations=None):
     cur = (next((d for d in leases if d["mac"] in macs and d["mac"] in (stations or {})), None)
            or next((d for d in leases if d["mac"] in macs), None))
     if cur and cur["ip"] != u["ip"]:
-        tag += f" <span class='tag bad'>on {esc(cur['ip'])}: turn its Wi-Fi off and on to apply the limits</span>"
+        tag += f" <span class=tag>on {esc(cur['ip'])} (limits active)</span>"
     if stations is not None:
         tag += " <span class='tag ok'>online</span>" if any(m in stations for m in macs) else " <span class=tag>offline</span>"
     if u.get("psk"):
@@ -651,8 +651,6 @@ def devices_inner(cfg, leases, stations=None):
     for d in sorted(leases, key=lambda d: (d["mac"] not in stations, d["ip"])):
         st_ = stations.get(d["mac"])
         who = ("<b>" + esc(reg[d["mac"]]["name"]) + "</b>") if d["mac"] in reg else "<span class=tag>guest</span>"
-        if d["mac"] in reg and reg[d["mac"]]["ip"] != d["ip"]:
-            who += " <span class='tag bad'>not on its fixed IP yet</span>"
         online = "<span class='tag ok'>online</span>" if st_ else "<span class=mut>offline</span>"
         sig = f"{st_['signal']} dBm" if st_ and st_["signal"] is not None else "-"
         rate = f"{st_['rate']:.0f} Mbps" if st_ and st_["rate"] else "-"
