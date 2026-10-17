@@ -350,6 +350,7 @@ def setup_dhcp(cfg, st, restart=True):
     if st.get("dhcp") == h:
         return False
     run(f"pihole-FTL --config dhcp.hosts '{arr}'")
+    run("pihole-FTL --config dns.hosts '[\"10.42.0.1 nek0.lan\", \"10.42.0.1 router.lan\"]'", check=False)
     st["dhcp"] = h
     if restart:
         run("systemctl restart pihole-FTL")

@@ -996,14 +996,15 @@ def setup():
     write_auth(ask_new_password())
     if not os.path.exists(CERT):
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", KEY, "-out", CERT,
-                        "-days", "3650", "-subj", "/CN=nek0", "-addext", "subjectAltName=IP:10.42.0.1"],
+                        "-days", "3650", "-subj", "/CN=nek0.lan",
+                        "-addext", "subjectAltName=IP:10.42.0.1,DNS:nek0.lan,DNS:router.lan,DNS:nek0.local"],
                        check=True, capture_output=True)
         os.chmod(KEY, 0o600)
     with open("/etc/systemd/system/nek0web.service", "w") as f:
         f.write(UNIT)
     subprocess.run("systemctl daemon-reload && systemctl enable nek0web.service && systemctl restart nek0web.service",
                    shell=True, check=True)
-    print("done. Open https://10.42.0.1:8443 from a device on the F-06 Wi-Fi (accept the certificate warning).")
+    print("done. Open https://nek0.lan:8443 or https://10.42.0.1:8443 from a device on the F-06 Wi-Fi (accept the certificate warning).")
 
 
 def update():
