@@ -1,17 +1,23 @@
 # /opt/nek0/users.yaml  (managed by `nek0ctl` and the dashboard, or edit by hand then: sudo nek0ctl apply)
 interface: wlan0
 total_mbps: 90        # ceiling for all users together (Wi-Fi side)
-guest_mbps: 30        # every device that is not a user shares this
+guest_mbps: 15        # all unknown devices share this pool
+guest_per_mbps: 5     # ceiling for each individual guest device
 throttle_kbps: 256    # speed a user drops to after passing their quota
+watchdog: true        # restart hostapd if wlan0 link drops
 # Optional backup internet through a phone hotspot joined by a second Wi-Fi adapter (see docs/SETUP.md)
 # uplink:
 #   backup_iface: wlan1
+#   primary_iface: eth0
 #   min_mbps: 3            # Ethernet slower than this twice in a row = switch
 #   backup_cap_mbps: 10    # total speed limit while on the hotspot (protects mobile data)
 users:
   - name: ali
     mac: aa:bb:cc:dd:ee:01   # the device's Wi-Fi MAC for THIS network (phones: private address is fine)
+    # extra_macs:            # additional MACs for the same person (share fixed IP, limits, and usage)
+    #   - de:ad:be:ef:00:02
     ip: 10.42.0.20           # 10.42.0.2 - 10.42.0.99 (outside the DHCP pool .100-.250)
     down_mbps: 20
     up_mbps: 10
     quota_gb: 50             # omit for unlimited
+    # psk: ali-secret-wifi   # optional personal Wi-Fi password (auto-attaches rotated MACs)

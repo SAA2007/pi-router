@@ -1,15 +1,19 @@
-# Ideas
+# Roadmap & Ideas
 
-Done: usage totals and history, pause/resume, backups, rename-safe usage.
+Done (`v0.3.4`):
+- Per-user download/upload limits (HTB + CAKE) and monthly quotas with automatic reset
+- Usage totals, 14-day history charts, live rates, pause/resume, rename-safe usage, backups
+- Automatic phone-hotspot failover (`wlan1`) with mobile-data speed cap and recovery checks
+- Multi-MAC support (`extra_macs`), 1-click unknown-device adoption, and instant limit enforcement on active DHCP leases
+- Per-user personal Wi-Fi passwords (`wpa_psk_file`) with anti-password-sharing auto-adoption
+- Shared + per-device guest speed caps (`guest_mbps` + `guest_per_mbps`)
+- Local `.lan` DNS (`nek0.lan`, `router.lan`)
+- ESP32-C3 USB status light & physical button daemon (`nek0led.service` + `esp32/main.py`)
 
 Next candidates:
-- Per-device usage for guests (dynamic nftables counters)
-- Scheduled pause windows (for example internet off at night) and bonus-data top-ups
+- 1-click "Gaming / Priority Mode" (temporarily cap all other users/guests to 1 Mbps)
+- Pi-hole stats & 1-click "Pause ad-blocking for 5 min" button inside the dashboard
+- Scheduled pause/throttle windows (for example late-night caps) and bonus-data top-ups
 - Quota alerts (Telegram, email or a dashboard banner at 80% / 100%)
-- Wi-Fi QR code for visitors, and a separate guest Wi-Fi with its own password and time limit
-- Block lists per user (Pi-hole groups) and DNS query log per device in the dashboard
-- Upstream speed test button and uplink health graph; auto-tuned CAKE on the uplink for fair sharing when the link is congested
-- Real HTTPS (Tailscale certificate or own CA) set up automatically
-- Optional 2.4 GHz network for IoT devices (second radio or ESP32 bridge)
-- Client isolation, MAC allow-list mode, WPA3 once the radio supports it reliably
-- A `.deb` package, an installer script and a read-only status page
+- Wi-Fi QR code for visitors
+- Block lists per user (Pi-hole groups) in the dashboard

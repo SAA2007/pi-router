@@ -620,7 +620,7 @@ def uplink_inner(cfg, st):
     ls = n.led_state(cfg, st)
     ldesc = {"OK": "<span class='tag ok'>Steady ON (OK)</span>",
              "HOTSPOT": "<span class=tag>Double-blink (Hotspot)</span>",
-             "NO_NET": "<span class='tag bad'>Fast blink (No internet)</span>",
+             "NO_NET": "<span class='tag bad'>Slow blink (No internet)</span>",
              "AP_DOWN": "<span class='tag bad'>Triple-blink (Wi-Fi down)</span>",
              "OFF": "<span class=tag>Off (night/muted)</span>"}.get(ls, ls)
     return f"<b>Internet via:</b> {via}{mode}{sp}<div style='margin-top:4px'><b>ESP32 status light:</b> {ldesc}</div>"
@@ -748,13 +748,16 @@ def dashboard(sess, nonce=None):
                    + form(csrf, "wifi_revert", "", "Revert now", "g") + "</div></div>")
 
     if cfg.get("uplink"):
+        uf = st.get("uplink", {}).get("force")
+        lm = st.get("led_mode", "auto")
         up_btns = ("<div class=row style='margin-top:8px'>"
-                   + form(csrf, "uplink", "<input type=hidden name=mode value=auto>", "Automatic", "g")
-                   + form(csrf, "uplink", "<input type=hidden name=mode value=hotspot>", "Use phone hotspot", "g")
-                   + form(csrf, "uplink", "<input type=hidden name=mode value=ethernet>", "Use Ethernet", "g")
-                   + form(csrf, "led", "<input type=hidden name=mode value=auto>", "LED: Normal", "g")
-                   + form(csrf, "led", "<input type=hidden name=mode value=night>", "LED: Errors only", "g")
-                   + form(csrf, "led", "<input type=hidden name=mode value=off>", "LED: Off", "g")
+                   + form(csrf, "uplink", "<input type=hidden name=mode value=auto>", "Automatic", "g" if uf else "")
+                   + form(csrf, "uplink", "<input type=hidden name=mode value=hotspot>", "Use phone hotspot", "" if uf == "backup" else "g")
+                   + form(csrf, "uplink", "<input type=hidden name=mode value=ethernet>", "Use Ethernet", "" if uf == "primary" else "g")
+                   + "</div><div class=row style='margin-top:6px'>"
+                   + form(csrf, "led", "<input type=hidden name=mode value=auto>", "LED: Normal", "" if lm == "auto" else "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=night>", "LED: Errors only", "" if lm == "night" else "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=off>", "LED: Off", "" if lm == "off" else "g")
                    + form(csrf, "led", "<input type=hidden name=mode value=blink>", "Blink device count", "g")
                    + "</div>")
         out.append("<div class=card><div id=uplink>" + uplink_inner(cfg, st) + "</div>" + up_btns + "</div>")
@@ -762,7 +765,8 @@ def dashboard(sess, nonce=None):
     out.append("<div class=card><h2>Data used this month</h2><div id=usage>" + usage_inner(cfg, st) + "</div></div>")
 
     # users
-    out.append("<div class=card><h2>Users</h2>")
+    n_on = sum(1 for u in cfg["users"] if any(m in stations for m in n.user_macs(u)))
+    out.append(f"<div class=card><h2>Users <span class=mut>({n_on} online / {len(cfg['users'])} total)</span></h2>")
     if not cfg["users"]:
         out.append("<p class=mut>No users yet. Everyone is in the guest pool. Add a connected device below.</p>")
     for u in cfg["users"]:
