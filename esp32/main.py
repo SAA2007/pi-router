@@ -4,26 +4,25 @@
 #   - GPIO 9: Onboard BOOT button (active-LOW, internal pull-up)
 # Serial protocol over USB CDC (/dev/ttyACM0, 115200 baud):
 #   Pi -> ESP32:
-#     STATE:OK         Steady glow + brief heartbeat wink every 5s (Ethernet internet OK)
-#     STATE:HOTSPOT    Double-pulse every 2s (Running on phone hotspot failover)
-#     STATE:NO_NET     Fast 5 Hz urgent strobe (No internet on Ethernet or Hotspot)
-#     STATE:AP_DOWN    Triple-blink every 2s (Wi-Fi AP wlan0 / hostapd is down)
-#     STATE:OFF        LED completely off (night mode when healthy)
-#     BLINK:<n>        Blink <n> times distinctly (e.g. number of online Wi-Fi users)
+#     STATE:OK         Solid steady ON (Ethernet internet OK)
+#     STATE:HOTSPOT    Slow double-blink every 3.5s (Phone hotspot failover)
+#     STATE:NO_NET     Slow 1s blink (0.8s ON / 0.8s OFF - No internet)
+#     STATE:AP_DOWN    Slow triple-blink every 4s (Wi-Fi AP wlan0 is down)
+#     STATE:OFF        LED completely off (night/stealth mode)
+#     BLINK:<n>        Slowly blink <n> times (connected Wi-Fi device count)
 #   ESP32 -> Pi:
-#     BTN:SHORT        Short press on BOOT button (< 2s) -> blink online user count + poll
-#     BTN:LONG         Long press on BOOT button (>= 2.5s) -> toggle hotspot / auto uplink
+#     BTN:SHORT        Short press on BOOT button (< 2s) -> toggle LED power / show status
+#     BTN:LONG         Long press on BOOT button (>= 3s) -> toggle hotspot / action
 
 import select
 import sys
 import time
-from machine import Pin, PWM, WDT
+from machine import Pin, WDT
 
 LED_PIN = 8
 BTN_PIN = 9
 
-# Active-LOW PWM on GPIO 8: duty_u16 = 65535 is OFF, 0 is 100% ON
-pwm = PWM(Pin(LED_PIN, Pin.OUT), freq=1000, duty_u16=65535)
+led = Pin(LED_PIN, Pin.OUT, value=1)  # active-LOW: 1 = OFF, 0 = ON
 btn = Pin(BTN_PIN, Pin.IN, Pin.PULL_UP)
 
 try:
@@ -40,41 +39,28 @@ def feed():
             pass
 
 
-def set_led(brightness):
-    """brightness: 0.0 (OFF) to 1.0 (full ON) for active-LOW GPIO 8 LED."""
-    if brightness <= 0.0:
-        pwm.duty_u16(65535)
-    elif brightness >= 1.0:
-        pwm.duty_u16(0)
-    else:
-        pwm.duty_u16(int(65535 * (1.0 - brightness)))
+def set_led(on):
+    led.value(0 if on else 1)
 
 
 def blink_count(n):
-    set_led(0.0)
-    time.sleep_ms(250)
+    set_led(False)
+    time.sleep_ms(400)
     for _ in range(max(1, min(20, n))):
         feed()
-        set_led(1.0)
-        time.sleep_ms(180)
-        set_led(0.0)
-        time.sleep_ms(220)
-    time.sleep_ms(300)
+        set_led(True)
+        time.sleep_ms(400)
+        set_led(False)
+        time.sleep_ms(400)
+    time.sleep_ms(500)
 
-
-# Startup self-test: 3 quick crisp flashes so user sees ESP32 booted
-for _ in range(3):
-    set_led(1.0)
-    time.sleep_ms(80)
-    set_led(0.0)
-    time.sleep_ms(80)
 
 poll = select.poll()
 poll.register(sys.stdin, select.POLLIN)
 
-state = "NO_NET"
+state = "OK"
+local_off = False
 last_rx = time.ticks_ms()
-buf = ""
 btn_down_at = 0
 btn_long_sent = False
 
@@ -82,35 +68,35 @@ while True:
     feed()
     now = time.ticks_ms()
 
-    # 1. Read non-blocking commands from Pi over USB serial
+    # 1. Read complete lines from Pi over USB serial
     while poll.poll(0):
-        ch = sys.stdin.read(1)
-        if not ch:
+        line = sys.stdin.readline()
+        if not line:
             break
-        if ch == "\n":
-            line = buf.strip()
-            buf = ""
-            if line.startswith("STATE:"):
-                state = line.split(":", 1)[1].strip()
-                last_rx = now
-            elif line.startswith("BLINK:"):
-                try:
-                    blink_count(int(line.split(":", 1)[1]))
-                except Exception:
-                    pass
-                last_rx = now
-            elif line == "PING":
-                last_rx = now
-                sys.stdout.write("PONG\n")
-        elif len(buf) < 64:
-            buf += ch
+        line = line.strip()
+        if line.startswith("STATE:"):
+            new_st = line.split(":", 1)[1].strip()
+            if new_st != state:
+                state = new_st
+            last_rx = now
+        elif line.startswith("BLINK:"):
+            try:
+                blink_count(int(line.split(":", 1)[1]))
+            except Exception:
+                pass
+            last_rx = now
+        elif line == "PING":
+            last_rx = now
+            sys.stdout.write("PONG\n")
 
     # 2. Check BOOT button (GPIO 9, active-LOW)
+    #    Short press: toggle LED power ON/OFF right from the button!
+    #    Long press (3s): send BTN:LONG to Pi
     if btn.value() == 0:
         if btn_down_at == 0:
             btn_down_at = now
             btn_long_sent = False
-        elif not btn_long_sent and time.ticks_diff(now, btn_down_at) >= 2500:
+        elif not btn_long_sent and time.ticks_diff(now, btn_down_at) >= 3000:
             btn_long_sent = True
             sys.stdout.write("BTN:LONG\n")
             blink_count(2)
@@ -118,37 +104,40 @@ while True:
         if btn_down_at != 0:
             held = time.ticks_diff(now, btn_down_at)
             btn_down_at = 0
-            if 40 <= held < 2500 and not btn_long_sent:
+            if 40 <= held < 3000 and not btn_long_sent:
+                local_off = not local_off
                 sys.stdout.write("BTN:SHORT\n")
 
-    # 3. If Pi hasn't sent a heartbeat in >30s, show disconnected blip
-    if time.ticks_diff(now, last_rx) > 30000:
-        phase = now % 3000
-        set_led(1.0 if phase < 40 else 0.0)
-        time.sleep_ms(20)
+    # 3. If locally toggled OFF via button or Pi sent STATE:OFF, keep LED off
+    #    (unless there is an active NO_NET / AP_DOWN error!)
+    if (local_off or state == "OFF") and state not in ("NO_NET", "AP_DOWN"):
+        set_led(False)
+        time.sleep_ms(40)
         continue
 
-    # 4. Render LED pattern for current router state
-    if state == "OK":
-        # Solid ON (70% comfortable brightness) with a 60ms heartbeat wink every 4s
-        phase = now % 4000
-        set_led(0.0 if phase < 60 else 0.7)
-    elif state == "HOTSPOT":
-        # Double-pulse every 2s: ON 120ms, OFF 120ms, ON 120ms, OFF 1640ms
-        phase = now % 2000
-        set_led(1.0 if (phase < 120 or 240 <= phase < 360) else 0.0)
-    elif state == "NO_NET":
-        # Urgent fast 5 Hz strobe: ON 100ms, OFF 100ms
-        phase = now % 200
-        set_led(1.0 if phase < 100 else 0.0)
-    elif state == "AP_DOWN":
-        # Triple-blink every 2s (Wi-Fi AP error)
-        phase = now % 2000
-        on = (phase < 100) or (200 <= phase < 300) or (400 <= phase < 500)
-        set_led(1.0 if on else 0.0)
-    elif state == "OFF":
-        set_led(0.0)
-    else:
-        set_led(0.2)
+    # 4. If Pi hasn't sent a heartbeat in >45s, turn LED off
+    if time.ticks_diff(now, last_rx) > 45000:
+        set_led(False)
+        time.sleep_ms(40)
+        continue
 
-    time.sleep_ms(20)
+    # 5. Calm, slow LED patterns
+    if state == "OK":
+        # Solid steady ON (zero blinking)
+        set_led(True)
+    elif state == "HOTSPOT":
+        # Slow double-blink every 3.5s (400ms ON, 400ms OFF, 400ms ON, 2300ms OFF)
+        phase = now % 3500
+        set_led(phase < 400 or (800 <= phase < 1200))
+    elif state == "NO_NET":
+        # Calm 1.6s slow blink (800ms ON, 800ms OFF)
+        phase = now % 1600
+        set_led(phase < 800)
+    elif state == "AP_DOWN":
+        # Slow triple-blink every 4s
+        phase = now % 4000
+        set_led(phase < 350 or (700 <= phase < 1050) or (1400 <= phase < 1750))
+    else:
+        set_led(False)
+
+    time.sleep_ms(40)

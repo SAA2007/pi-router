@@ -945,9 +945,10 @@ def cmd_led_daemon():
                 while ser.in_waiting:
                     line = ser.readline().decode(errors="ignore").strip()
                     if line == "BTN:SHORT":
-                        _, iw = run(f"iw dev {cfg['interface']} station dump", check=False)
-                        n_sta = len(re.findall(r"(?m)^Station ([0-9a-fA-F:]{17})", iw or ""))
-                        ser.write(f"BLINK:{max(1, n_sta)}\n".encode("ascii"))
+                        st["led_mode"] = "auto" if st.get("led_mode") in ("night", "off") else "night"
+                        save_state(st)
+                        cur = led_state(cfg, st)
+                        ser.write(f"STATE:{cur}\n".encode("ascii"))
                     elif line == "BTN:LONG" and cfg.get("uplink"):
                         nxt = "auto" if st.get("uplink", {}).get("force") == "backup" else "hotspot"
                         run(f"/usr/bin/python3 /opt/nek0/nek0ctl.py uplink {nxt}", check=False)
