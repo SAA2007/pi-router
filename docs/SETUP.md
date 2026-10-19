@@ -127,3 +127,17 @@ sudo nmcli connection add type wifi ifname wlan1 con-name hotspot ssid 'YOUR-SSI
 
 Use `examples/nek0.nft` (it masquerades and protects `wlan1` too), then add the `uplink:` section from `examples/users.yaml`. A small USB adapter is usually 2.4 GHz only, so set the phone's hotspot to 2.4 GHz. While the hotspot is in use everyone's traffic uses your mobile data, hence the speed cap.
 
+## 10. Optional: ESP32-C3 Mini USB status light & button
+
+Plug an ESP32-C3 SuperMini / Mini into the Pi over USB (`/dev/ttyACM0`), flash MicroPython, and copy `esp32/main.py` onto it:
+
+```
+sudo apt install -y esptool python3-serial mpremote
+curl -fsSL -o /tmp/mp_c3.bin https://micropython.org/resources/firmware/ESP32_GENERIC_C3-20241129-v1.24.1.bin
+sudo esptool --chip esp32c3 --port /dev/ttyACM0 erase_flash
+sudo esptool --chip esp32c3 --port /dev/ttyACM0 write_flash -z 0x0 /tmp/mp_c3.bin
+sudo mpremote connect /dev/ttyACM0 fs cp esp32/main.py :main.py + reset
+```
+
+`nek0led.service` (installed automatically by `sudo python3 nek0ctl.py install`) drives the onboard `GPIO 8` LED (`Steady ON` = Ethernet OK, `Double-blink` = Hotspot failover, `Slow blink` = No internet, `Triple-blink` = Wi-Fi AP down) and reads the onboard `BOOT` button (`GPIO 9`: short press toggles LED night mode; 3s hold toggles hotspot failover).
+
