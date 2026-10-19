@@ -32,7 +32,7 @@ import time
 
 import yaml
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 BASE = os.environ.get("NEK0_DIR", "/opt/nek0")
 CONF = os.path.join(BASE, "users.yaml")
@@ -40,6 +40,7 @@ STATE = os.path.join(BASE, "state.json")
 LOCK = os.environ.get("NEK0_LOCK", "/run/nek0ctl.lock")
 LEASES = os.environ.get("NEK0_LEASES", "/etc/pihole/dhcp.leases")
 PSK_FILE = os.environ.get("NEK0_PSK_FILE", "/etc/hostapd/hostapd.psk")
+ESP_PORT = os.environ.get("NEK0_ESP_PORT", "/dev/ttyACM0")
 IFB = "ifb0"
 DEFAULT_PROBE = "https://speed.cloudflare.com/__down?bytes=3000000"
 GB = 1000 ** 3
@@ -94,6 +95,19 @@ OnUnitActiveSec=30
 
 [Install]
 WantedBy=timers.target
+"""
+
+SVC_LED = """[Unit]
+Description=nek0 ESP32-C3 status LED and button daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/nek0/nek0ctl.py led-daemon
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
 """
 
 
@@ -869,6 +883,88 @@ def cmd_restore(path):
     print("restored. Run: sudo nek0ctl apply")
 
 
+def led_state(cfg, st):
+    """Return the ESP32-C3 LED state string: OK, HOTSPOT, NO_NET, AP_DOWN, or OFF."""
+    mode = st.get("led_mode", "auto")
+    if mode == "off":
+        return "OFF"
+    if iface_state(cfg["interface"]) == "down":
+        return "AP_DOWN"
+    up = cfg.get("uplink") or {}
+    u = st.get("uplink") or {}
+    if u.get("mode") == "backup":
+        if not backup_gw(up.get("backup_iface", "wlan1")):
+            return "NO_NET"
+        return "HOTSPOT"
+    prim = up.get("primary_iface", "eth0")
+    if iface_state(prim) == "down" or not backup_gw(prim) or u.get("bad", 0) >= 1:
+        return "NO_NET"
+    return "OFF" if mode == "night" else "OK"
+
+
+def led_send(line):
+    """Send a single line command to the ESP32-C3 if connected."""
+    if DRY or not os.path.exists(ESP_PORT):
+        return False
+    try:
+        import serial
+        with serial.Serial(ESP_PORT, 115200, timeout=0.3, write_timeout=0.5) as s:
+            s.write((line.strip() + "\n").encode("ascii"))
+        return True
+    except Exception:
+        return False
+
+
+def cmd_led(cfg, st, arg):
+    if arg in ("auto", "night", "off"):
+        st["led_mode"] = arg
+        led_send(f"STATE:{led_state(cfg, st)}")
+    elif arg == "blink":
+        _, iw = run(f"iw dev {cfg['interface']} station dump", check=False)
+        n_sta = len(re.findall(r"(?m)^Station ([0-9a-fA-F:]{17})", iw or ""))
+        led_send(f"BLINK:{max(1, n_sta)}")
+    elif arg not in (None, "status"):
+        sys.exit("usage: sudo nek0ctl led [status|auto|night|off|blink]")
+    conn = "connected" if os.path.exists(ESP_PORT) else "not connected"
+    print(f"esp32 led: {conn} ({ESP_PORT}) | mode: {st.get('led_mode', 'auto')} | state: {led_state(cfg, st)}")
+
+
+def cmd_led_daemon():
+    """Background daemon that updates the ESP32-C3 LED every 2s and handles its BOOT button."""
+    import serial
+    ser = None
+    last_state = None
+    while True:
+        try:
+            cfg, st = load(), load_state()
+            cur = led_state(cfg, st)
+            if ser is None and os.path.exists(ESP_PORT):
+                ser = serial.Serial(ESP_PORT, 115200, timeout=0.1, write_timeout=0.5)
+            if ser is not None:
+                ser.write(f"STATE:{cur}\n".encode("ascii"))
+                while ser.in_waiting:
+                    line = ser.readline().decode(errors="ignore").strip()
+                    if line == "BTN:SHORT":
+                        _, iw = run(f"iw dev {cfg['interface']} station dump", check=False)
+                        n_sta = len(re.findall(r"(?m)^Station ([0-9a-fA-F:]{17})", iw or ""))
+                        ser.write(f"BLINK:{max(1, n_sta)}\n".encode("ascii"))
+                    elif line == "BTN:LONG" and cfg.get("uplink"):
+                        nxt = "auto" if st.get("uplink", {}).get("force") == "backup" else "hotspot"
+                        run(f"/usr/bin/python3 /opt/nek0/nek0ctl.py uplink {nxt}", check=False)
+            # If Ethernet just dropped while in primary mode, trigger an immediate poll for faster failover
+            if last_state == "OK" and cur == "NO_NET":
+                run("/usr/bin/python3 /opt/nek0/nek0ctl.py poll", check=False)
+            last_state = cur
+        except Exception:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+        time.sleep(2)
+
+
 def cmd_install():
     os.makedirs("/opt/nek0", exist_ok=True)
     saved = cmd_backup() if BASE == "/opt/nek0" else None  # an update never loses users or usage
@@ -884,19 +980,19 @@ def cmd_install():
     if not os.path.exists("/usr/local/bin/nek0ctl"):
         os.symlink(dst, "/usr/local/bin/nek0ctl")
     for name, text in (("nek0ctl.service", SVC_APPLY), ("nek0ctl-poll.service", SVC_POLL),
-                       ("nek0ctl-poll.timer", TIMER)):
+                       ("nek0ctl-poll.timer", TIMER), ("nek0led.service", SVC_LED)):
         with open(f"/etc/systemd/system/{name}", "w") as f:
             f.write(text)
     run("systemctl daemon-reload")
-    run("systemctl enable nek0ctl.service nek0ctl-poll.timer")
+    run("systemctl enable nek0ctl.service nek0ctl-poll.timer nek0led.service")
     run("systemctl restart nek0ctl.service")  # re-runs apply so new versions take effect now
-    run("systemctl restart nek0ctl-poll.timer")
+    run("systemctl restart nek0ctl-poll.timer nek0led.service")
     print(f"installed nek0ctl {__version__}. Edit /opt/nek0/users.yaml, then run: sudo nek0ctl apply")
 
 
 def main():
     cmds = ("install", "apply", "poll", "status", "reset", "devices", "add", "set", "remove",
-            "pause", "resume", "backup", "restore", "uplink")
+            "pause", "resume", "backup", "restore", "uplink", "led", "led-daemon")
     if not ARGS or ARGS[0] not in cmds:
         sys.exit(__doc__)
     if not DRY and os.geteuid() != 0:
@@ -904,6 +1000,8 @@ def main():
     cmd = ARGS[0]
     if cmd == "install":
         return cmd_install()
+    if cmd == "led-daemon":
+        return cmd_led_daemon()
     if cmd == "backup":
         return print(cmd_backup() or "nothing to back up")
     if cmd == "restore":
@@ -934,6 +1032,8 @@ def main():
         cmd_remove(cfg, st, ARGS[1])
     elif cmd == "uplink":
         cmd_uplink(cfg, st, ARGS[1] if len(ARGS) > 1 else None)
+    elif cmd == "led":
+        cmd_led(cfg, st, ARGS[1] if len(ARGS) > 1 else None)
     elif cmd in ("pause", "resume"):
         if len(ARGS) < 2:
             sys.exit(f"usage: sudo nek0ctl {cmd} NAME")

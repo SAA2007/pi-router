@@ -29,7 +29,7 @@ import urllib.parse
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.environ.get("NEK0_DIR", "/opt/nek0")
 AUTH = os.path.join(BASE, "web_auth.json")
@@ -481,6 +481,22 @@ def a_uplink(f):
     return "ok", f"Internet link forced to {'phone hotspot' if mode == 'hotspot' else 'Ethernet'}."
 
 
+def a_led(f):
+    cfg, st = n.load(), n.load_state()
+    mode = f.get("mode", "auto")
+    if mode == "blink":
+        stations = read_stations(cfg["interface"])
+        n.led_send(f"BLINK:{max(1, len(stations))}")
+        return "ok", f"Blinking {max(1, len(stations))} time(s) on the ESP32 status light."
+    if mode not in ("auto", "night", "off"):
+        raise ValueError("LED mode must be auto, night, off, or blink")
+    st["led_mode"] = mode
+    n.save_state(st)
+    n.led_send(f"STATE:{n.led_state(cfg, st)}")
+    labels = {"auto": "normal (steady ON when OK)", "night": "night mode (off when OK, blinks on errors)", "off": "off"}
+    return "ok", f"ESP32 status light set to {labels[mode]}."
+
+
 def a_password(f):
     if not check_pw(f.get("current", "")):
         raise ValueError("current password is wrong")
@@ -491,7 +507,7 @@ def a_password(f):
 
 
 ACTIONS = {"add": a_add, "adopt": a_adopt, "set": a_set, "pause": a_pause, "resume": a_pause, "remove": a_remove, "reset": a_reset, "limits": a_limits,
-           "uplink": a_uplink, "wifi": a_wifi, "wifi_keep": a_wifi_keep, "wifi_revert": a_wifi_revert, "password": a_password}
+           "uplink": a_uplink, "led": a_led, "wifi": a_wifi, "wifi_keep": a_wifi_keep, "wifi_revert": a_wifi_revert, "password": a_password}
 
 
 def perform(act, form):
@@ -601,7 +617,13 @@ def uplink_inner(cfg, st):
     via = "phone hotspot (Ethernet is down or slow)" if u.get("mode") == "backup" else "hostel Ethernet"
     mode = " (forced)" if u.get("force") else " (automatic)"
     sp = f" &middot; last Ethernet speed check {u['mbps']} Mbps" if u.get("mbps") is not None else ""
-    return f"<b>Internet via:</b> {via}{mode}{sp}"
+    ls = n.led_state(cfg, st)
+    ldesc = {"OK": "<span class='tag ok'>Steady ON (OK)</span>",
+             "HOTSPOT": "<span class=tag>Double-blink (Hotspot)</span>",
+             "NO_NET": "<span class='tag bad'>Fast blink (No internet)</span>",
+             "AP_DOWN": "<span class='tag bad'>Triple-blink (Wi-Fi down)</span>",
+             "OFF": "<span class=tag>Off (night/muted)</span>"}.get(ls, ls)
+    return f"<b>Internet via:</b> {via}{mode}{sp}<div style='margin-top:4px'><b>ESP32 status light:</b> {ldesc}</div>"
 
 
 def usage_inner(cfg, st):
@@ -730,6 +752,10 @@ def dashboard(sess, nonce=None):
                    + form(csrf, "uplink", "<input type=hidden name=mode value=auto>", "Automatic", "g")
                    + form(csrf, "uplink", "<input type=hidden name=mode value=hotspot>", "Use phone hotspot", "g")
                    + form(csrf, "uplink", "<input type=hidden name=mode value=ethernet>", "Use Ethernet", "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=auto>", "LED: Normal", "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=night>", "LED: Errors only", "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=off>", "LED: Off", "g")
+                   + form(csrf, "led", "<input type=hidden name=mode value=blink>", "Blink device count", "g")
                    + "</div>")
         out.append("<div class=card><div id=uplink>" + uplink_inner(cfg, st) + "</div>" + up_btns + "</div>")
     # usage overview

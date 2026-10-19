@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+- ESP32-C3 USB status light & button (`esp32/main.py` + `nek0led.service` / `nek0ctl led`): shows live router health via the onboard GPIO 8 LED (`Steady ON` = Ethernet OK, `Double-blink` = Phone Hotspot failover, `Fast 5 Hz flash` = No Internet, `Triple-blink` = Wi-Fi AP down, `Off` = Night/muted mode). Short-pressing the ESP32 BOOT button (`GPIO 9`) blinks out the number of connected Wi-Fi devices; holding it for 2.5s toggles hotspot failover.
+- Instant limits on new users: `setup_shaping` and `setup_accounting` now include any active DHCP lease IP already held by a user's MAC (`user_ips`), so speed limits and usage tracking take effect immediately without toggling Wi-Fi.
+
 ## 0.3.3
 - Personal Wi-Fi passwords (`psk` per user via `hostapd` `wpa_psk_file`): each user can optionally have their own Wi-Fi password (`nek0ctl set NAME psk PASS` or in the dashboard). When their phone connects with a new random MAC, `nek0ctl` automatically attaches the new MAC to that user (only when none of that user's existing devices is already online, preventing password sharing).
 - Per-guest speed limit (`guest_per_mbps`, default 5 Mbps inside the 15 Mbps shared `guest_mbps` pool): each unknown device is capped individually while sharing the guest pool.

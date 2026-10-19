@@ -575,3 +575,21 @@ def test_cli_case_insensitive_and_web_uplink(env, monkeypatch):
     assert n.load_state()["uplink"]["force"] == "backup"
     assert w.perform("uplink", {"mode": "auto"})[0] == "ok"
     assert "force" not in n.load_state()["uplink"]
+
+
+def test_esp32_led_states_and_web_control(env, monkeypatch):
+    cfg, st, _cmds, _s = uplink_env(env, monkeypatch)
+    monkeypatch.setattr(n, "iface_state", lambda dev: "up")
+    assert n.led_state(cfg, st) == "OK"
+    st["led_mode"] = "night"
+    assert n.led_state(cfg, st) == "OFF"       # night mode: dark when OK
+    st["uplink"] = {"mode": "backup"}
+    assert n.led_state(cfg, st) == "HOTSPOT"   # night mode still alerts on hotspot/errors
+    monkeypatch.setattr(n, "backup_gw", lambda dev: None)
+    assert n.led_state(cfg, st) == "NO_NET"
+    monkeypatch.setattr(n, "iface_state", lambda dev: "down" if dev == "wlan0" else "up")
+    assert n.led_state(cfg, st) == "AP_DOWN"
+    assert w.perform("led", {"mode": "off"})[0] == "ok"
+    assert n.load_state()["led_mode"] == "off"
+    assert n.led_state(cfg, n.load_state()) == "OFF"
+
