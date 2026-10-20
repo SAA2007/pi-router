@@ -33,6 +33,7 @@ import time
 import yaml
 
 __version__ = "0.3.4"
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 BASE = os.environ.get("NEK0_DIR", "/opt/nek0")
 CONF = os.path.join(BASE, "users.yaml")
@@ -41,6 +42,8 @@ LOCK = os.environ.get("NEK0_LOCK", "/run/nek0ctl.lock")
 LEASES = os.environ.get("NEK0_LEASES", "/etc/pihole/dhcp.leases")
 PSK_FILE = os.environ.get("NEK0_PSK_FILE", "/etc/hostapd/hostapd.psk")
 ESP_PORT = os.environ.get("NEK0_ESP_PORT", "/dev/ttyACM0")
+RADAR_STATE = os.environ.get("NEK0_RADAR_STATE", "/run/nek0-radar.json")
+ESP_BSSID = "dc:1e:d5:1e:63:41"
 IFB = "ifb0"
 DEFAULT_PROBE = "https://speed.cloudflare.com/__down?bytes=3000000"
 GB = 1000 ** 3
@@ -929,11 +932,89 @@ def cmd_led(cfg, st, arg):
     print(f"esp32 led: {conn} ({ESP_PORT}) | mode: {st.get('led_mode', 'auto')} | state: {led_state(cfg, st)}")
 
 
+def sample_radar(hist, scan_dev="wlan1"):
+    """Single-channel (2437 MHz, ~130ms) RF multipath sampler using ESP32-C3 indoor beacon + room APs."""
+    if DRY:
+        return
+    rc, out = run(f"/usr/sbin/iw dev {scan_dev} scan freq 2437", check=False)
+    if rc != 0 or not out:
+        return
+    now = time.time()
+    beams = {}
+    for blk in re.split(r"(?m)^BSS ", out)[1:]:
+        m_mac = re.match(r"([0-9a-fA-F:]{17})", blk)
+        m_sig = re.search(r"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", blk)
+        if not m_mac or not m_sig:
+            continue
+        bssid = m_mac.group(1).lower()
+        sig = float(m_sig.group(1))
+        m_ssid = re.search(r"SSID:\s*(.+)", blk)
+        ssid = (m_ssid.group(1).strip() if m_ssid else "")
+        if bssid == ESP_BSSID:
+            ssid = "ESP32-C3 (Indoor Beam)"
+        beams[bssid] = (sig, ssid)
+    if not beams:
+        return
+    b_hist = hist.setdefault("beams", {})
+    weighted_var, total_w = 0.0, 0.0
+    beam_list = []
+    for bssid, (sig, ssid) in beams.items():
+        rec = b_hist.setdefault(bssid, {"pts": [], "ssid": ssid})
+        if ssid:
+            rec["ssid"] = ssid
+        pts = rec["pts"]
+        pts.append((now, sig))
+        rec["pts"] = [(t, v) for t, v in pts if now - t <= 24][-12:]
+        vals = [v for _, v in rec["pts"]]
+        if len(vals) >= 2:
+            mean = sum(vals) / len(vals)
+            std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+            step = abs(vals[-1] - vals[-2])
+            fluct = max(std, step * 0.65)
+            w = 2.2 if bssid == ESP_BSSID else 1.0
+            weighted_var += fluct * w
+            total_w += w
+        else:
+            fluct = 0.0
+        beam_list.append({
+            "bssid": bssid,
+            "name": rec["ssid"] or bssid[-8:],
+            "rssi": round(sig, 1),
+            "delta": round(fluct, 2),
+            "indoor": bssid == ESP_BSSID,
+        })
+    avg_fluct = (weighted_var / total_w) if total_w > 0 else 0.0
+    # Convert dB fluctuation into a 0..100 motion energy score (typical quiet floor ~0.3 dB, walking ~2.0+ dB)
+    energy = int(min(100, max(0, round((avg_fluct - 0.25) / 2.0 * 100))))
+    ehist = hist.setdefault("energy", [])
+    ehist.append(energy)
+    hist["energy"] = ehist[-24:]
+    smooth = int(round(sum(hist["energy"][-3:]) / len(hist["energy"][-3:])))
+    state = "MOTION" if smooth >= 42 else ("PRESENCE" if smooth >= 16 else "STILL")
+    beam_list.sort(key=lambda x: (not x["indoor"], -x["rssi"]))
+    payload = {
+        "ts": int(now),
+        "state": state,
+        "energy": smooth,
+        "history": hist["energy"],
+        "esp_rssi": beams.get(ESP_BSSID, (None,))[0],
+        "beams": beam_list[:6],
+    }
+    try:
+        tmp = RADAR_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, RADAR_STATE)
+    except OSError:
+        pass
+
+
 def cmd_led_daemon():
-    """Background daemon that updates the ESP32-C3 LED every 2s and handles its BOOT button."""
+    """Background daemon that updates the ESP32-C3 LED every 2s, handles its BOOT button, and samples RF radar."""
     import serial
     ser = None
     last_state = None
+    radar_hist = {}
     while True:
         try:
             cfg, st = load(), load_state()
@@ -952,6 +1033,9 @@ def cmd_led_daemon():
                     elif line == "BTN:LONG" and cfg.get("uplink"):
                         nxt = "auto" if st.get("uplink", {}).get("force") == "backup" else "hotspot"
                         run(f"/usr/bin/python3 /opt/nek0/nek0ctl.py uplink {nxt}", check=False)
+            # Sample 2.4 GHz RF radar on wlan1 when wlan1 is not actively serving hotspot internet
+            if (st.get("uplink") or {}).get("mode") != "backup":
+                sample_radar(radar_hist, (cfg.get("uplink") or {}).get("backup_iface", "wlan1"))
             # If Ethernet just dropped while in primary mode, trigger an immediate poll for faster failover
             if last_state == "OK" and cur == "NO_NET":
                 run("/usr/bin/python3 /opt/nek0/nek0ctl.py poll", check=False)

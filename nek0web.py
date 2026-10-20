@@ -554,7 +554,7 @@ def esc(x):
 
 SCRIPT = ("setInterval(function(){fetch('/stats',{credentials:'same-origin'}).then(function(r){return r.json()})"
           ".then(function(d){for(var k in d){var e=document.getElementById(k);if(e){e.innerHTML=d[k]}}})"
-          ".catch(function(){})},15000);")
+          ".catch(function(){})},5000);")
 
 
 def page(title, body, nonce=None):
@@ -624,6 +624,34 @@ def uplink_inner(cfg, st):
              "AP_DOWN": "<span class='tag bad'>Triple-blink (Wi-Fi down)</span>",
              "OFF": "<span class=tag>Off (night/muted)</span>"}.get(ls, ls)
     return f"<b>Internet via:</b> {via}{mode}{sp}<div style='margin-top:4px'><b>ESP32 status light:</b> {ldesc}</div>"
+
+
+def radar_inner():
+    try:
+        with open(n.RADAR_STATE) as f:
+            r = json.load(f)
+    except (OSError, ValueError):
+        return "<div class=mut>Calibrating 2.4 GHz RF beams (ESP32-C3 + room multipath)...</div>"
+    if time.time() - r.get("ts", 0) > 30:
+        return "<div class=mut>RF radar paused (2.4 GHz radio busy with hotspot).</div>"
+    st_lbl = {
+        "STILL": "<span class='tag ok'>Still / Quiet</span>",
+        "PRESENCE": "<span class=tag>Presence (Micro-motion)</span>",
+        "MOTION": "<span class='tag bad'>Movement Detected</span>",
+    }.get(r.get("state"), "<span class=tag>Calibrating</span>")
+    energy = int(r.get("energy", 0))
+    hist = r.get("history") or [energy]
+    bars = "".join(f"<i title='Motion energy: {v}%' style='height:{max(4, v)}%;background:{'var(--bad)' if v >= 42 else ('var(--acc)' if v >= 16 else 'var(--ok)')}'></i>" for v in hist)
+    beams = []
+    for b in r.get("beams") or []:
+        cls = "tag bad" if b["delta"] >= 1.5 else ("tag ok" if b.get("indoor") else "tag")
+        beams.append(f"<span class='{cls}' style='margin-right:6px;display:inline-block;margin-top:4px'>"
+                     f"{esc(b['name'])}: {b['rssi']:.0f} dBm (&plusmn;{b['delta']:.1f} dB)</span>")
+    return (f"<div class=row style='justify-content:space-between;align-items:center'>"
+            f"<div><b>Room RF Radar:</b> {st_lbl} &middot; <span class=mut>motion energy <b>{energy}%</b></span></div></div>"
+            f"<div class='bar{' hot' if energy >= 42 else ''}'><i style='width:{energy}%'></i></div>"
+            f"<div class=spark style='height:28px'>{bars}</div>"
+            f"<div class=mut>{''.join(beams)}</div>")
 
 
 def usage_inner(cfg, st):
@@ -724,7 +752,7 @@ def fragments():
     cfg, st = n.load(), n.load_state()
     n.monthly_reset(st)
     leases, stations = n.read_leases(), read_stations(cfg["interface"])
-    out = {"uplink": uplink_inner(cfg, st), "usage": usage_inner(cfg, st), "devices": devices_inner(cfg, leases, stations)}
+    out = {"uplink": uplink_inner(cfg, st), "radar": radar_inner(), "usage": usage_inner(cfg, st), "devices": devices_inner(cfg, leases, stations)}
     for u in cfg["users"]:
         out["u_" + u["key"]] = user_stats(u, st, leases, stations)
     return out
@@ -760,7 +788,9 @@ def dashboard(sess, nonce=None):
                    + form(csrf, "led", "<input type=hidden name=mode value=off>", "LED: Off", "" if lm == "off" else "g")
                    + form(csrf, "led", "<input type=hidden name=mode value=blink>", "Blink device count", "g")
                    + "</div>")
-        out.append("<div class=card><div id=uplink>" + uplink_inner(cfg, st) + "</div>" + up_btns + "</div>")
+        out.append("<div class=card><div id=uplink>" + uplink_inner(cfg, st) + "</div>" + up_btns
+                   + "<div style='border-top:1px solid var(--line);margin-top:10px;padding-top:10px' id=radar>"
+                   + radar_inner() + "</div></div>")
     # usage overview
     out.append("<div class=card><h2>Data used this month</h2><div id=usage>" + usage_inner(cfg, st) + "</div></div>")
 

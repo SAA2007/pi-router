@@ -19,6 +19,16 @@ import sys
 import time
 from machine import Pin, WDT
 
+# Enable 2.4 GHz RF beacon on Channel 6 (2437 MHz) for room RF presence/motion sensing.
+# Runs entirely in ESP32-C3 Wi-Fi MAC hardware (0% CPU blocking on LED or BOOT button).
+try:
+    import network
+    _ap = network.WLAN(network.AP_IF)
+    _ap.active(True)
+    _ap.config(essid="nek0-sense", channel=6, hidden=True, authmode=0)
+except Exception:
+    _ap = None
+
 LED_PIN = 8
 BTN_PIN = 9
 
