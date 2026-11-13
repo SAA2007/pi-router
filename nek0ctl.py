@@ -141,6 +141,9 @@ def load():
     cfg.setdefault("guest_per_mbps", 5)
     cfg.setdefault("throttle_kbps", 256)
     cfg.setdefault("watchdog", True)
+    cfg.setdefault("router_mode", "nat")
+    if cfg["router_mode"] not in ("nat", "bridge"):
+        sys.exit("router_mode must be 'nat' or 'bridge'")
     up = cfg.get("uplink")
     if up:
         up.setdefault("primary_iface", "eth0")
@@ -374,6 +377,68 @@ def setup_dhcp(cfg, st, restart=True):
     return True
 
 
+def setup_mode(cfg, st, restart=True):
+    """Switch between NAT mode (wlan0 routed + Pi-hole DHCP) and Bridge mode (br0 = eth0 + wlan0, Hostel DHCP)."""
+    want = cfg.get("router_mode", "nat")
+    prev = st.get("router_mode", "nat")
+    br_exists = not DRY and os.path.exists("/sys/class/net/br0")
+    if want == "nat" and prev == "nat" and not br_exists:
+        return False
+    prim = (cfg.get("uplink") or {}).get("primary_iface", "eth0")
+    dev = cfg["interface"]
+    hostapd_conf = "/etc/hostapd/hostapd.conf"
+    if want == "bridge":
+        run("modprobe br_netfilter", check=False)
+        run("sysctl -w net.bridge.bridge-nf-call-iptables=1", check=False)
+        run("pihole-FTL --config dhcp.active false", check=False)
+        # Ensure zero DHCP server packets can ever egress eth0
+        run(f'nft add rule ip nek0filter output oifname "{prim}" udp sport 67 drop', check=False)
+        if not DRY and os.path.exists(hostapd_conf):
+            lines = [l for l in open(hostapd_conf).read().splitlines() if not l.startswith("bridge=")]
+            lines.append("bridge=br0")
+            with open(hostapd_conf, "w") as f:
+                f.write("\n".join(lines) + "\n")
+        if want != prev or DRY or not br_exists:
+            _, eth_info = run(f"ip -4 addr show dev {prim}", check=False)
+            m_ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", eth_info or "")
+            eth_cidr = m_ip.group(1) if m_ip else None
+            gw = backup_gw(prim)
+            run("ip link add name br0 type bridge", check=False)
+            if not DRY and os.path.exists(f"/sys/class/net/{prim}/address"):
+                mac = open(f"/sys/class/net/{prim}/address").read().strip()
+                run(f"ip link set dev br0 address {mac}", check=False)
+            run(f"ip link set {prim} master br0", check=False)
+            run(f"ip link set {dev} master br0", check=False)
+            run("ip link set br0 up", check=False)
+            run(f"ip addr flush dev {prim}", check=False)
+            run(f"ip addr flush dev {dev}", check=False)
+            run("ip addr replace 10.42.0.1/24 dev br0", check=False)
+            if eth_cidr:
+                run(f"ip addr replace {eth_cidr} dev br0", check=False)
+            if gw:
+                run(f"ip route replace default via {gw} dev br0 metric 100", check=False)
+            run("dhcpcd -4 -b br0", check=False)
+            if restart:
+                run("systemctl restart hostapd", check=False)
+    else:
+        if not DRY and os.path.exists(hostapd_conf):
+            lines = [l for l in open(hostapd_conf).read().splitlines() if not l.startswith("bridge=")]
+            with open(hostapd_conf, "w") as f:
+                f.write("\n".join(lines) + "\n")
+        run("dhcpcd -k br0", check=False)
+        run(f"ip link set {dev} nomaster", check=False)
+        run(f"ip link set {prim} nomaster", check=False)
+        run("ip link del br0", check=False)
+        run(f"ip addr replace 10.42.0.1/24 dev {dev}", check=False)
+        run(f"nmcli -w 10 device connect {prim}", check=False)
+        run("pihole-FTL --config dhcp.active true", check=False)
+        if restart:
+            run("systemctl restart hostapd", check=False)
+    changed = (want != prev)
+    st["router_mode"] = want
+    return changed
+
+
 def setup_psk(cfg):
     """Write personal Wi-Fi passwords (wpa_psk_file) and reload hostapd without dropping connections."""
     lines = [f"keyid={u['key']} 00:00:00:00:00:00 {u['psk']}" for u in cfg["users"] if u.get("psk")]
@@ -440,11 +505,17 @@ def setup_shaping(cfg):
             for ip in user_ips(cfg, u, leases):
                 run(f"tc filter add dev {d} parent 1: protocol ip prio 1 u32 "
                     f"match ip {side} {ip}/32 flowid 1:{u['cid']}")
+            if cfg.get("router_mode") == "bridge":
+                m_field = "dst_mac" if side == "dst" else "src_mac"
+                for mac in user_macs(u):
+                    run(f"tc filter add dev {d} parent 1: protocol ip prio 1 flower "
+                        f"{m_field} {mac} classid 1:{u['cid']}", check=False)
 
 
 def accounting_text(cfg):
     dev = cfg["interface"]
     leases = read_leases()
+    bridge = cfg.get("router_mode") == "bridge"
     lines = ["table ip nek0acct", "delete table ip nek0acct", "table ip nek0acct {"]
     for u in cfg["users"]:
         lines.append(f"  counter c_{u['key']} {{ packets 0 bytes 0 }}")
@@ -453,13 +524,23 @@ def accounting_text(cfg):
     lines.append("    type filter hook forward priority 10; policy accept;")
     for u in cfg["users"]:
         if u["paused"]:
-            for ip in user_ips(cfg, u, leases):
-                lines.append(f"    ip saddr {ip} drop")
-                lines.append(f"    ip daddr {ip} drop")
+            if bridge:
+                for mac in user_macs(u):
+                    lines.append(f"    ether saddr {mac} drop")
+                    lines.append(f"    ether daddr {mac} drop")
+            else:
+                for ip in user_ips(cfg, u, leases):
+                    lines.append(f"    ip saddr {ip} drop")
+                    lines.append(f"    ip daddr {ip} drop")
     for u in cfg["users"]:
-        for ip in user_ips(cfg, u, leases):
-            lines.append(f"    ip saddr {ip} counter name c_{u['key']}")
-            lines.append(f"    ip daddr {ip} counter name c_{u['key']}")
+        if bridge:
+            for mac in user_macs(u):
+                lines.append(f"    ether saddr {mac} counter name c_{u['key']}")
+                lines.append(f"    ether daddr {mac} counter name c_{u['key']}")
+        else:
+            for ip in user_ips(cfg, u, leases):
+                lines.append(f"    ip saddr {ip} counter name c_{u['key']}")
+                lines.append(f"    ip daddr {ip} counter name c_{u['key']}")
     lines.append(f'    iifname "{dev}" counter name c_total')
     lines.append(f'    oifname "{dev}" counter name c_total')
     lines += ["  }", "}"]
@@ -475,8 +556,9 @@ def cmd_apply(cfg, st, restart_ftl=True):
     run("nft -c -f -", stdin=accounting_text(cfg))  # syntax check before touching anything
     monthly_reset(st)
     collect(cfg, st)  # bank usage before the counters are rebuilt
+    mode_changed = setup_mode(cfg, st, restart=restart_ftl)
     setup_psk(cfg)
-    need_restart = setup_dhcp(cfg, st, restart=restart_ftl)
+    need_restart = setup_dhcp(cfg, st, restart=restart_ftl) or mode_changed
     setup_shaping(cfg)
     setup_accounting(cfg)
     for u in cfg["users"]:
@@ -726,20 +808,32 @@ def num_cli(v, what="value"):
 
 def read_leases():
     out = []
+    seen_macs = set()
     try:
         with open(LEASES) as f:
             for line in f:
                 p = line.split()
                 if len(p) >= 4:
-                    out.append({"mac": p[1].lower(), "ip": p[2], "host": "" if p[3] == "*" else p[3]})
+                    m = p[1].lower()
+                    seen_macs.add(m)
+                    out.append({"mac": m, "ip": p[2], "host": "" if p[3] == "*" else p[3]})
     except OSError:
         pass
+    if not DRY and os.path.exists("/sys/class/net/br0"):
+        _, neigh = run("ip -4 neigh show dev br0", check=False)
+        for line in (neigh or "").splitlines():
+            m = re.match(r"(\d+\.\d+\.\d+\.\d+)\s+lladdr\s+([0-9a-fA-F:]{17})", line.strip())
+            if m and m.group(2).lower() not in seen_macs:
+                seen_macs.add(m.group(2).lower())
+                out.append({"mac": m.group(2).lower(), "ip": m.group(1), "host": ""})
     return sorted(out, key=lambda d: ipaddress.ip_address(d["ip"]))
 
 
 def save_cfg(cfg):
     data = {k: cfg[k] for k in ("interface", "total_mbps", "guest_mbps", "guest_per_mbps", "throttle_kbps", "watchdog")
             if cfg.get(k) is not None}
+    if cfg.get("router_mode") == "bridge":
+        data["router_mode"] = "bridge"
     if cfg.get("uplink"):
         data["uplink"] = {k: cfg["uplink"][k] for k in ("backup_iface", "primary_iface", "min_mbps", "backup_cap_mbps", "probe_url")}
     data["users"] = [{k: u[k] for k in ("name", "mac", "extra_macs", "ip", "down_mbps", "up_mbps", "quota_gb", "psk", "paused")
@@ -918,6 +1012,18 @@ def led_send(line):
         return False
 
 
+def cmd_mode(cfg, st, arg):
+    if arg in ("nat", "bridge"):
+        cfg["router_mode"] = arg
+        save_cfg(cfg)
+        cmd_apply(load(), st)
+    elif arg is not None:
+        sys.exit("usage: sudo nek0ctl mode [nat|bridge]")
+    m = cfg.get("router_mode", "nat")
+    desc = "Bridge (AP Mode - Hostel DHCP, 0 rogue DHCP)" if m == "bridge" else "NAT (Routed - 10.42.0.x, Pi-hole DHCP)"
+    print(f"router mode: {m} ({desc})")
+
+
 def cmd_led(cfg, st, arg):
     if arg in ("auto", "night", "off"):
         st["led_mode"] = arg
@@ -932,29 +1038,72 @@ def cmd_led(cfg, st, arg):
     print(f"esp32 led: {conn} ({ESP_PORT}) | mode: {st.get('led_mode', 'auto')} | state: {led_state(cfg, st)}")
 
 
+def ingest_csi(hist, line):
+    """Parse a hardware 52-subcarrier CSI line from the ESP32-C3: CSI:pkts,rssi,dev_x1000,b0..b15."""
+    try:
+        parts = [int(x) for x in line[4:].split(",")]
+        if len(parts) < 19:
+            return
+        pkts, rssi, dev_x1000 = parts[0], parts[1], parts[2]
+        bins = parts[3:19]
+    except ValueError:
+        return
+    now = time.time()
+    frames = hist.setdefault("csi_frames", [])
+    if pkts > 0:
+        frames.append((now, pkts, rssi, dev_x1000, bins))
+    hist["csi_frames"] = [f for f in frames if now - f[0] <= 8.0][-12:]
+    recent = hist["csi_frames"]
+    if not recent:
+        hist["csi"] = {"ts": now, "hz": 0, "rssi": rssi, "dev": 0.0, "ripple": 0.0, "energy": 0, "bins": bins}
+        return
+    hz = int(round(sum(f[1] for f in recent[-4:]) * 2 / len(recent[-4:])))
+    avg_dev = sum(f[3] for f in recent[-4:]) / len(recent[-4:]) / 10.0  # % deviation
+    # Compute temporal standard deviation across each of the 16 OFDM subcarrier groups
+    if len(recent) >= 2:
+        ripples = []
+        for b_idx in range(16):
+            b_vals = [f[4][b_idx] for f in recent[-6:]]
+            b_mean = sum(b_vals) / len(b_vals)
+            b_std = (sum((v - b_mean) ** 2 for v in b_vals) / len(b_vals)) ** 0.5
+            ripples.append(b_std)
+        ripple = sum(ripples) / len(ripples)
+    else:
+        ripple = 0.0
+    # Combine on-chip per-MAC CSI deviation and 16-subcarrier temporal ripple into 0..100 energy
+    raw_e = max((avg_dev - 1.8) * 14.0, (ripple - 0.6) * 22.0)
+    csi_energy = int(min(100, max(0, round(raw_e))))
+    hist["csi"] = {
+        "ts": now,
+        "hz": hz,
+        "rssi": recent[-1][2],
+        "dev": round(avg_dev, 2),
+        "ripple": round(ripple, 2),
+        "energy": csi_energy,
+        "bins": recent[-1][4],
+    }
+
+
 def sample_radar(hist, scan_dev="wlan1"):
-    """Single-channel (2437 MHz, ~130ms) RF multipath sampler using ESP32-C3 indoor beacon + room APs."""
+    """Combine ESP32-C3 hardware 52-subcarrier CSI with 2437 MHz room multipath beams."""
     if DRY:
         return
     rc, out = run(f"/usr/sbin/iw dev {scan_dev} scan freq 2437", check=False)
-    if rc != 0 or not out:
-        return
     now = time.time()
     beams = {}
-    for blk in re.split(r"(?m)^BSS ", out)[1:]:
-        m_mac = re.match(r"([0-9a-fA-F:]{17})", blk)
-        m_sig = re.search(r"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", blk)
-        if not m_mac or not m_sig:
-            continue
-        bssid = m_mac.group(1).lower()
-        sig = float(m_sig.group(1))
-        m_ssid = re.search(r"SSID:\s*(.+)", blk)
-        ssid = (m_ssid.group(1).strip() if m_ssid else "")
-        if bssid == ESP_BSSID:
-            ssid = "ESP32-C3 (Indoor Beam)"
-        beams[bssid] = (sig, ssid)
-    if not beams:
-        return
+    if rc == 0 and out:
+        for blk in re.split(r"(?m)^BSS ", out)[1:]:
+            m_mac = re.match(r"([0-9a-fA-F:]{17})", blk)
+            m_sig = re.search(r"signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", blk)
+            if not m_mac or not m_sig:
+                continue
+            bssid = m_mac.group(1).lower()
+            sig = float(m_sig.group(1))
+            m_ssid = re.search(r"SSID:\s*(.+)", blk)
+            ssid = (m_ssid.group(1).strip() if m_ssid else "")
+            if bssid == ESP_BSSID:
+                ssid = "ESP32-C3 (Indoor Beam)"
+            beams[bssid] = (sig, ssid)
     b_hist = hist.setdefault("beams", {})
     weighted_var, total_w = 0.0, 0.0
     beam_list = []
@@ -984,8 +1133,10 @@ def sample_radar(hist, scan_dev="wlan1"):
             "indoor": bssid == ESP_BSSID,
         })
     avg_fluct = (weighted_var / total_w) if total_w > 0 else 0.0
-    # Convert dB fluctuation into a 0..100 motion energy score (typical quiet floor ~0.3 dB, walking ~2.0+ dB)
-    energy = int(min(100, max(0, round((avg_fluct - 0.25) / 2.0 * 100))))
+    rssi_energy = int(min(100, max(0, round((avg_fluct - 0.25) / 2.0 * 100))))
+    csi = hist.get("csi")
+    csi_active = bool(csi and (now - csi.get("ts", 0) <= 10.0))
+    energy = max(rssi_energy, csi["energy"]) if csi_active else rssi_energy
     ehist = hist.setdefault("energy", [])
     ehist.append(energy)
     hist["energy"] = ehist[-24:]
@@ -999,6 +1150,11 @@ def sample_radar(hist, scan_dev="wlan1"):
         "history": hist["energy"],
         "esp_rssi": beams.get(ESP_BSSID, (None,))[0],
         "beams": beam_list[:6],
+        "csi_active": csi_active,
+        "csi_hz": csi.get("hz", 0) if csi_active else 0,
+        "csi_dev": csi.get("dev", 0.0) if csi_active else 0.0,
+        "csi_ripple": csi.get("ripple", 0.0) if csi_active else 0.0,
+        "subcarriers": csi.get("bins", []) if csi_active else [],
     }
     try:
         tmp = RADAR_STATE + ".tmp"
@@ -1010,7 +1166,7 @@ def sample_radar(hist, scan_dev="wlan1"):
 
 
 def cmd_led_daemon():
-    """Background daemon that updates the ESP32-C3 LED every 2s, handles its BOOT button, and samples RF radar."""
+    """Background daemon that updates the ESP32-C3 LED, handles its BOOT button, and processes 52-subcarrier CSI."""
     import serial
     ser = None
     last_state = None
@@ -1023,16 +1179,22 @@ def cmd_led_daemon():
                 ser = serial.Serial(ESP_PORT, 115200, timeout=0.1, write_timeout=0.5)
             if ser is not None:
                 ser.write(f"STATE:{cur}\n".encode("ascii"))
-                while ser.in_waiting:
-                    line = ser.readline().decode(errors="ignore").strip()
-                    if line == "BTN:SHORT":
-                        st["led_mode"] = "auto" if st.get("led_mode") in ("night", "off") else "night"
-                        save_state(st)
-                        cur = led_state(cfg, st)
-                        ser.write(f"STATE:{cur}\n".encode("ascii"))
-                    elif line == "BTN:LONG" and cfg.get("uplink"):
-                        nxt = "auto" if st.get("uplink", {}).get("force") == "backup" else "hotspot"
-                        run(f"/usr/bin/python3 /opt/nek0/nek0ctl.py uplink {nxt}", check=False)
+                for _ in range(4):
+                    while ser.in_waiting:
+                        line = ser.readline().decode(errors="ignore").strip()
+                        if line.startswith("CSI:"):
+                            ingest_csi(radar_hist, line)
+                        elif line == "BTN:SHORT":
+                            st["led_mode"] = "auto" if st.get("led_mode") in ("night", "off") else "night"
+                            save_state(st)
+                            cur = led_state(cfg, st)
+                            ser.write(f"STATE:{cur}\n".encode("ascii"))
+                        elif line == "BTN:LONG" and cfg.get("uplink"):
+                            nxt = "auto" if st.get("uplink", {}).get("force") == "backup" else "hotspot"
+                            run(f"/usr/bin/python3 /opt/nek0/nek0ctl.py uplink {nxt}", check=False)
+                    time.sleep(0.45)
+            else:
+                time.sleep(1.8)
             # Sample 2.4 GHz RF radar on wlan1 when wlan1 is not actively serving hotspot internet
             if (st.get("uplink") or {}).get("mode") != "backup":
                 sample_radar(radar_hist, (cfg.get("uplink") or {}).get("backup_iface", "wlan1"))
@@ -1047,7 +1209,7 @@ def cmd_led_daemon():
                 except Exception:
                     pass
                 ser = None
-        time.sleep(2)
+            time.sleep(2)
 
 
 def cmd_install():
@@ -1077,7 +1239,7 @@ def cmd_install():
 
 def main():
     cmds = ("install", "apply", "poll", "status", "reset", "devices", "add", "set", "remove",
-            "pause", "resume", "backup", "restore", "uplink", "led", "led-daemon")
+            "pause", "resume", "backup", "restore", "uplink", "mode", "led", "led-daemon")
     if not ARGS or ARGS[0] not in cmds:
         sys.exit(__doc__)
     if not DRY and os.geteuid() != 0:
@@ -1117,6 +1279,8 @@ def main():
         cmd_remove(cfg, st, ARGS[1])
     elif cmd == "uplink":
         cmd_uplink(cfg, st, ARGS[1] if len(ARGS) > 1 else None)
+    elif cmd == "mode":
+        cmd_mode(cfg, st, ARGS[1] if len(ARGS) > 1 else None)
     elif cmd == "led":
         cmd_led(cfg, st, ARGS[1] if len(ARGS) > 1 else None)
     elif cmd in ("pause", "resume"):

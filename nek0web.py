@@ -481,6 +481,25 @@ def a_uplink(f):
     return "ok", f"Internet link forced to {'phone hotspot' if mode == 'hotspot' else 'Ethernet'}."
 
 
+def a_mode(f):
+    cfg = n.load()
+    old = cfg.get("router_mode", "nat")
+    mode = f.get("mode", "nat")
+    if mode not in ("nat", "bridge"):
+        raise ValueError("router mode must be nat or bridge")
+    cfg["router_mode"] = mode
+    commit(cfg)
+    if mode != old:
+        def job():
+            time.sleep(1.5)
+            n.run("systemctl restart hostapd", check=False)
+            time.sleep(2)
+            n.run("systemctl restart nek0ctl.service", check=False)
+        threading.Thread(target=job, daemon=True).start()
+    desc = "Bridge / AP Mode (Hostel DHCP, 0 rogue DHCP)" if mode == "bridge" else "NAT Mode (Routed 10.42.0.x, Pi-hole DHCP)"
+    return "ok", f"Router mode set to {desc}. Wi-Fi devices will refresh their IP in a few seconds."
+
+
 def a_led(f):
     cfg, st = n.load(), n.load_state()
     mode = f.get("mode", "auto")
@@ -507,7 +526,7 @@ def a_password(f):
 
 
 ACTIONS = {"add": a_add, "adopt": a_adopt, "set": a_set, "pause": a_pause, "resume": a_pause, "remove": a_remove, "reset": a_reset, "limits": a_limits,
-           "uplink": a_uplink, "led": a_led, "wifi": a_wifi, "wifi_keep": a_wifi_keep, "wifi_revert": a_wifi_revert, "password": a_password}
+           "uplink": a_uplink, "mode": a_mode, "led": a_led, "wifi": a_wifi, "wifi_keep": a_wifi_keep, "wifi_revert": a_wifi_revert, "password": a_password}
 
 
 def perform(act, form):
@@ -623,7 +642,12 @@ def uplink_inner(cfg, st):
              "NO_NET": "<span class='tag bad'>Slow blink (No internet)</span>",
              "AP_DOWN": "<span class='tag bad'>Triple-blink (Wi-Fi down)</span>",
              "OFF": "<span class=tag>Off (night/muted)</span>"}.get(ls, ls)
-    return f"<b>Internet via:</b> {via}{mode}{sp}<div style='margin-top:4px'><b>ESP32 status light:</b> {ldesc}</div>"
+    rm = cfg.get("router_mode", "nat")
+    rdesc = ("<span class='tag ok'>Bridge / AP Mode (Hostel DHCP &middot; MAC speed limits active)</span>"
+             if rm == "bridge" else
+             "<span class='tag ok'>NAT Routed (10.42.0.x &middot; Pi-hole DHCP)</span>")
+    return (f"<b>Internet via:</b> {via}{mode}{sp}"
+            f"<div style='margin-top:4px'><b>Router mode:</b> {rdesc} &middot; <b>ESP32 status light:</b> {ldesc}</div>")
 
 
 def radar_inner():
@@ -642,15 +666,27 @@ def radar_inner():
     energy = int(r.get("energy", 0))
     hist = r.get("history") or [energy]
     bars = "".join(f"<i title='Motion energy: {v}%' style='height:{max(4, v)}%;background:{'var(--bad)' if v >= 42 else ('var(--acc)' if v >= 16 else 'var(--ok)')}'></i>" for v in hist)
+    csi_tag = ""
+    sub_html = ""
+    if r.get("csi_active"):
+        hz = int(r.get("csi_hz", 0))
+        dev = float(r.get("csi_dev", 0.0))
+        rip = float(r.get("csi_ripple", 0.0))
+        csi_tag = f" &middot; <span class='tag ok'>52-Subcarrier CSI ({hz} Hz)</span> <span class=mut>dev {dev:.1f}% / ripple {rip:.1f}</span>"
+        subs = r.get("subcarriers") or []
+        if subs:
+            sbars = "".join(f"<i title='Subcarrier band {i + 1}/16: {v}%' style='height:{max(8, min(100, v))}%;background:var(--acc);opacity:.75'></i>" for i, v in enumerate(subs))
+            sub_html = f"<div class=mut style='margin-top:4px'>52-Subcarrier OFDM Amplitude Profile (16 frequency bands):</div><div class=spark style='height:26px'>{sbars}</div>"
     beams = []
     for b in r.get("beams") or []:
         cls = "tag bad" if b["delta"] >= 1.5 else ("tag ok" if b.get("indoor") else "tag")
         beams.append(f"<span class='{cls}' style='margin-right:6px;display:inline-block;margin-top:4px'>"
                      f"{esc(b['name'])}: {b['rssi']:.0f} dBm (&plusmn;{b['delta']:.1f} dB)</span>")
     return (f"<div class=row style='justify-content:space-between;align-items:center'>"
-            f"<div><b>Room RF Radar:</b> {st_lbl} &middot; <span class=mut>motion energy <b>{energy}%</b></span></div></div>"
+            f"<div><b>Room RF Radar:</b> {st_lbl} &middot; <span class=mut>motion energy <b>{energy}%</b></span>{csi_tag}</div></div>"
             f"<div class='bar{' hot' if energy >= 42 else ''}'><i style='width:{energy}%'></i></div>"
             f"<div class=spark style='height:28px'>{bars}</div>"
+            f"{sub_html}"
             f"<div class=mut>{''.join(beams)}</div>")
 
 
@@ -778,10 +814,15 @@ def dashboard(sess, nonce=None):
     if cfg.get("uplink"):
         uf = st.get("uplink", {}).get("force")
         lm = st.get("led_mode", "auto")
+        rm = cfg.get("router_mode", "nat")
         up_btns = ("<div class=row style='margin-top:8px'>"
                    + form(csrf, "uplink", "<input type=hidden name=mode value=auto>", "Automatic", "g" if uf else "")
                    + form(csrf, "uplink", "<input type=hidden name=mode value=hotspot>", "Use phone hotspot", "" if uf == "backup" else "g")
                    + form(csrf, "uplink", "<input type=hidden name=mode value=ethernet>", "Use Ethernet", "" if uf == "primary" else "g")
+                   + form(csrf, "mode", "<input type=hidden name=mode value=nat>", "Mode: NAT (Routed)", "" if rm == "nat" else "g",
+                          "Switch router to NAT mode (10.42.0.x subnet with Pi-hole DHCP)?" if rm != "nat" else "")
+                   + form(csrf, "mode", "<input type=hidden name=mode value=bridge>", "Mode: Bridge (AP)", "" if rm == "bridge" else "g",
+                          "Switch router to Bridge / AP mode (disables Pi-hole DHCP; devices get Hostel IPs directly)?" if rm != "bridge" else "")
                    + "</div><div class=row style='margin-top:6px'>"
                    + form(csrf, "led", "<input type=hidden name=mode value=auto>", "LED: Normal", "" if lm == "auto" else "g")
                    + form(csrf, "led", "<input type=hidden name=mode value=night>", "LED: Errors only", "" if lm == "night" else "g")
@@ -1022,7 +1063,7 @@ def guard_firewall():
     """Make the dashboard unreachable from the hostel side (eth0), whatever it is bound to."""
     rules = ("table ip nek0web\ndelete table ip nek0web\ntable ip nek0web {\n  chain input {\n"
              "    type filter hook input priority 0; policy accept;\n"
-             f"    iifname != {{ \"wlan0\", \"lo\" }} tcp dport {PORT} drop\n  }}\n}}\n")
+             f"    iifname != {{ \"wlan0\", \"lo\", \"br0\", \"tailscale0\" }} tcp dport {PORT} drop\n  }}\n}}\n")
     n.run("nft -f -", stdin=rules)
 
 

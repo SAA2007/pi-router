@@ -593,3 +593,41 @@ def test_esp32_led_states_and_web_control(env, monkeypatch):
     assert n.load_state()["led_mode"] == "off"
     assert n.led_state(cfg, n.load_state()) == "OFF"
 
+
+def test_ingest_csi():
+    h = {}
+    n.ingest_csi(h, "CSI:12,-54,15,50,50,50,50,50,50,50,50,50,50,50,50,50,50,50,50")
+    assert h["csi"]["hz"] == 24
+    assert h["csi"]["energy"] == 0
+    n.ingest_csi(h, "CSI:15,-53,95,70,30,65,35,70,30,65,35,70,30,65,35,70,30,65,35")
+    assert h["csi"]["energy"] > 40
+    assert len(h["csi"]["bins"]) == 16
+
+
+def test_router_mode_bridge_and_nat_toggle(env):
+    tmp, cmds = env
+    data = clone(GOOD_USERS)
+    data["uplink"] = dict(UPLINK)
+    write_cfg(tmp, data)
+    # Default is NAT mode
+    assert n.load()["router_mode"] == "nat"
+    assert "NAT Routed" in w.uplink_inner(n.load(), {})
+    # Switch to Bridge mode via web action
+    assert w.perform("mode", {"mode": "bridge"})[0] == "ok"
+    cfg_b = n.load()
+    assert cfg_b["router_mode"] == "bridge"
+    assert "Bridge / AP Mode" in w.uplink_inner(cfg_b, {})
+    assert any("ip link add name br0 type bridge" in c for c in cmds)
+    assert any("pihole-FTL --config dhcp.active false" in c for c in cmds)
+    assert any("flower dst_mac aa:bb:cc:00:11:22 classid 1:10" in c for c in cmds)
+    acct_b = n.accounting_text(cfg_b)
+    assert "ether saddr aa:bb:cc:00:11:22 counter name c_ali" in acct_b
+    # Switch back to NAT mode
+    cmds.clear()
+    assert w.perform("mode", {"mode": "nat"})[0] == "ok"
+    assert n.load()["router_mode"] == "nat"
+    assert any("ip link del br0" in c for c in cmds)
+    assert any("pihole-FTL --config dhcp.active true" in c for c in cmds)
+
+
+
