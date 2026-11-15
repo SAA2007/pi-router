@@ -391,8 +391,8 @@ def setup_mode(cfg, st, restart=True):
         run("modprobe br_netfilter", check=False)
         run("sysctl -w net.bridge.bridge-nf-call-iptables=1", check=False)
         run("pihole-FTL --config dhcp.active false", check=False)
-        # Ensure zero DHCP server packets can ever egress eth0
-        run(f'nft add rule ip nek0filter output oifname "{prim}" udp sport 67 drop', check=False)
+        if not DRY and os.path.exists("/etc/systemd/network/10-wlan0.network"):
+            os.replace("/etc/systemd/network/10-wlan0.network", "/opt/nek0/10-wlan0.network.bak")
         if not DRY and os.path.exists(hostapd_conf):
             lines = [l for l in open(hostapd_conf).read().splitlines() if not l.startswith("bridge=")]
             lines.append("bridge=br0")
@@ -401,8 +401,8 @@ def setup_mode(cfg, st, restart=True):
         if want != prev or DRY or not br_exists:
             _, eth_info = run(f"ip -4 addr show dev {prim}", check=False)
             m_ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", eth_info or "")
-            eth_cidr = m_ip.group(1) if m_ip else None
-            gw = backup_gw(prim)
+            eth_cidr = m_ip.group(1) if m_ip else "10.1.186.53/24"
+            gw = backup_gw(prim) or "10.1.186.1"
             run("ip link add name br0 type bridge", check=False)
             if not DRY and os.path.exists(f"/sys/class/net/{prim}/address"):
                 mac = open(f"/sys/class/net/{prim}/address").read().strip()
@@ -413,14 +413,40 @@ def setup_mode(cfg, st, restart=True):
             run(f"ip addr flush dev {prim}", check=False)
             run(f"ip addr flush dev {dev}", check=False)
             run("ip addr replace 10.42.0.1/24 dev br0", check=False)
-            if eth_cidr:
-                run(f"ip addr replace {eth_cidr} dev br0", check=False)
-            if gw:
-                run(f"ip route replace default via {gw} dev br0 metric 100", check=False)
-            run("dhcpcd -4 -b br0", check=False)
+            run(f"ip addr replace {eth_cidr} dev br0", check=False)
+            run(f"ip route replace default via {gw} dev br0 metric 100", check=False)
             if restart:
                 run("systemctl restart hostapd", check=False)
+                run(f"ip addr flush dev {dev}", check=False)
+        br_nft = (
+            "table ip nek0nat\ndelete table ip nek0nat\n"
+            "table ip nek0nat {\n"
+            "  chain prerouting {\n"
+            "    type nat hook prerouting priority dstnat; policy accept;\n"
+            "    ip daddr 10.42.0.1 dnat to 10.42.0.1\n"
+            "  }\n"
+            "  chain postrouting {\n"
+            "    type nat hook postrouting priority srcnat; policy accept;\n"
+            "    oifname \"wlan1\" masquerade\n"
+            "  }\n"
+            "}\n"
+            "table ip nek0filter\ndelete table ip nek0filter\n"
+            "table ip nek0filter {\n"
+            "  chain input {\n"
+            "    type filter hook input priority filter; policy accept;\n"
+            "    iifname \"wlan1\" tcp dport { 53, 80, 443 } drop\n"
+            "    iifname \"wlan1\" udp dport { 53, 67 } drop\n"
+            "  }\n"
+            "  chain output {\n"
+            "    type filter hook output priority filter; policy accept;\n"
+            f"    oifname {{ \"{prim}\", \"br0\" }} udp sport 67 drop\n"
+            "  }\n"
+            "}\n"
+        )
+        run("nft -f -", stdin=br_nft, check=False)
     else:
+        if not DRY and os.path.exists("/opt/nek0/10-wlan0.network.bak"):
+            os.replace("/opt/nek0/10-wlan0.network.bak", "/etc/systemd/network/10-wlan0.network")
         if not DRY and os.path.exists(hostapd_conf):
             lines = [l for l in open(hostapd_conf).read().splitlines() if not l.startswith("bridge=")]
             with open(hostapd_conf, "w") as f:
@@ -432,8 +458,13 @@ def setup_mode(cfg, st, restart=True):
         run(f"ip addr replace 10.42.0.1/24 dev {dev}", check=False)
         run(f"nmcli -w 10 device connect {prim}", check=False)
         run("pihole-FTL --config dhcp.active true", check=False)
+        if not DRY and os.path.exists("/etc/nftables.conf"):
+            run("nft -f /etc/nftables.conf", check=False)
+        run(f'nft add chain ip nek0filter output {{ type filter hook output priority filter \\; policy accept \\; }}', check=False)
+        run(f'nft add rule ip nek0filter output oifname "{prim}" udp sport {{ 67, 68 }} drop', check=False)
         if restart:
             run("systemctl restart hostapd", check=False)
+            run(f"ip addr replace 10.42.0.1/24 dev {dev}", check=False)
     changed = (want != prev)
     st["router_mode"] = want
     return changed

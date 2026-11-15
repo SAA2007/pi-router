@@ -38,7 +38,7 @@ KEY = os.path.join(BASE, "web.key")
 GOOD = os.path.join(BASE, "hostapd.conf.last-good")
 PENDING = os.path.join(BASE, "wifi_pending.json")
 HOSTAPD = os.environ.get("NEK0_HOSTAPD", "/etc/hostapd/hostapd.conf")
-BIND = os.environ.get("NEK0_BIND", "10.42.0.1")
+BIND = os.environ.get("NEK0_BIND", "0.0.0.0")
 PORT = int(os.environ.get("NEK0_PORT", "8443"))
 CONFIRM_SECONDS = 150
 CHANNELS = (149, 153, 157, 161, 165)   # 5 GHz channels allowed in Pakistan (5725-5875 MHz)
@@ -1060,10 +1060,10 @@ def make_server():
 
 
 def guard_firewall():
-    """Make the dashboard unreachable from the hostel side (eth0), whatever it is bound to."""
+    """Make the dashboard unreachable from the backup hotspot side (wlan1), whatever it is bound to."""
     rules = ("table ip nek0web\ndelete table ip nek0web\ntable ip nek0web {\n  chain input {\n"
              "    type filter hook input priority 0; policy accept;\n"
-             f"    iifname != {{ \"wlan0\", \"lo\", \"br0\", \"tailscale0\" }} tcp dport {PORT} drop\n  }}\n}}\n")
+             f"    iifname \"wlan1\" tcp dport {PORT} drop\n  }}\n}}\n")
     n.run("nft -f -", stdin=rules)
 
 
